@@ -4,211 +4,143 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-	"fyne.io/fyne/v2/app"
-	"fyne.io/fyne/v2/canvas"
-	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/widget"
 	"github.com/kbinani/screenshot"
 	"github.com/nfnt/resize"
 	"image"
 	"image/jpeg"
-	"io"
 	"net"
-	"sync"
+	"os"
+	"strings"
 	"time"
 )
 
-var (
-	mu            sync.Mutex
-	clients       = make(map[string]net.Conn)
-	currentClient string
-	imgChan       = make(chan image.Image)
-)
+func resizeImage(img image.Image, width, height uint) image.Image {
+	return resize.Resize(width, height, img, resize.Lanczos3)
+}
 
 func main() {
-	listener, err := net.Listen("tcp", ":8093")
+	hostname, err := os.Hostname()
 	if err != nil {
-		fmt.Println("Error starting server:", err)
-		return
+		fmt.Println(err)
 	}
-	defer listener.Close()
 
-	showServerIP()
+	var ipAddress string = "192.168.3.197:8093"
 
-	fmt.Println("Server is listening on port 8093")
+	for ipAddress == "" {
+		ipAddress = scanForServer()
+	}
 
-	go acceptConnections(listener)
+	bounds := screenshot.GetDisplayBounds(0)
+	var x int = 2 * bounds.Dx() / 3
+	var y int = 2 * bounds.Dy() / 3
 
-	a := app.New()
-	w := a.NewWindow("Received Video Stream")
-
-	ipDropdown := widget.NewSelect([]string{}, func(value string) {
-		mu.Lock()
-		currentClient = value
-		mu.Unlock()
-		fmt.Println("Selected client:", value)
-	})
-
-	fyneImg := canvas.NewImageFromImage(nil)
-	fyneImg.FillMode = canvas.ImageFillOriginal
-
-	content := container.NewVBox(ipDropdown, fyneImg)
-	w.SetContent(content)
-
-	go func() {
-		for img := range imgChan {
-			fyneImg.Image = img
-			fyneImg.Refresh()
-		}
-	}()
-
-	go updateIPDropdown(ipDropdown)
-
-	w.ShowAndRun()
-}
-
-func acceptConnections(listener net.Listener) {
 	for {
-		conn, err := listener.Accept()
+		conn, err := connectToServer(ipAddress)
 		if err != nil {
-			fmt.Println("Error accepting connection:", err)
+			fmt.Println("Trying to reconnect in 5 seconds...")
+			time.Sleep(5 * time.Second)
 			continue
 		}
-
-		hostname := receiveHostname(conn)
-		if hostname == "" {
-			fmt.Println("Failed to receive hostname, closing connection")
-			conn.Close()
-			continue
-		}
-
-		fmt.Println("Accepted connection from:", hostname)
-
-		mu.Lock()
-		clients[hostname] = conn
-		if currentClient == "" {
-			currentClient = hostname
-		}
-		mu.Unlock()
-
-		go handleConnection(conn, hostname)
+		handleConnection(conn, x, y, hostname)
 	}
 }
 
-func receiveHostname(conn net.Conn) string {
-	var size int64
-	err := binary.Read(conn, binary.LittleEndian, &size)
+func scanForServer() string {
+	localIPs, err := getLocalIPs()
 	if err != nil {
-		fmt.Println("Error reading hostname size:", err)
-		return ""
+		fmt.Println("Error getting local IPs:", err)
 	}
 
-	buf := make([]byte, size)
-	_, err = io.ReadFull(conn, buf)
-	if err != nil {
-		fmt.Println("Error reading hostname:", err)
-		return ""
-	}
-
-	return string(buf)
-}
-
-func handleConnection(conn net.Conn, hostname string) {
-	defer func() {
-		mu.Lock()
-		delete(clients, hostname)
-		if currentClient == hostname {
-			if len(clients) > 0 {
-				for hn := range clients {
-					currentClient = hn
-					break
-				}
-			} else {
-				currentClient = ""
+	for _, ip := range localIPs {
+		for i := 1; i <= 254; i++ {
+			address := fmt.Sprintf("%s.%d:8093", ip, i)
+			conn, err := net.DialTimeout("tcp", address, time.Millisecond)
+			if err == nil {
+				conn.Close()
+				fmt.Println("Found server at:", address)
+				return address
 			}
 		}
-		mu.Unlock()
-		conn.Close()
-		fmt.Println("Closed connection from:", hostname)
-	}()
-
-	for {
-		var size int64
-		err := binary.Read(conn, binary.LittleEndian, &size)
-		if err != nil {
-			if err == io.EOF {
-				fmt.Println("Client disconnected:", hostname)
-				return
-			}
-			fmt.Println("Error reading image size from", hostname, ":", err)
-			return
-		}
-
-		buf := make([]byte, size)
-		_, err = io.ReadFull(conn, buf)
-		if err != nil {
-			if err == io.EOF {
-				fmt.Println("Client disconnected:", hostname)
-				return
-			}
-			fmt.Println("Error receiving image from", hostname, ":", err)
-			return
-		}
-
-		img, err := jpeg.Decode(bytes.NewReader(buf))
-		if err != nil {
-			fmt.Println("Error decoding image from", hostname, ":", err)
-			return
-		}
-
-		screenBounds := screenshot.GetDisplayBounds(0)
-		maxWidth := 4 * screenBounds.Dx() / 5
-		maxHeight := 4 * screenBounds.Dy() / 5
-
-		if img.Bounds().Dx() > maxWidth || img.Bounds().Dy() > maxHeight {
-			img = resize.Resize(uint(maxWidth), uint(maxHeight), img, resize.Lanczos3)
-		}
-
-		mu.Lock()
-		if hostname == currentClient {
-			imgChan <- img
-		}
-		mu.Unlock()
 	}
+	return ""
 }
 
-func updateIPDropdown(ipDropdown *widget.Select) {
-	for {
-		time.Sleep(5 * time.Second)
-
-		mu.Lock()
-		hostnames := make([]string, 0, len(clients))
-		for hn := range clients {
-			hostnames = append(hostnames, hn)
-		}
-		mu.Unlock()
-
-		ipDropdown.Options = hostnames
-		if len(hostnames) > 0 && currentClient == "" {
-			currentClient = hostnames[0]
-			ipDropdown.SetSelected(currentClient)
-		}
-	}
-}
-
-func showServerIP() {
+func getLocalIPs() ([]string, error) {
+	var ips []string
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
-		fmt.Println("Error getting IP addresses:", err)
-		return
+		return nil, err
 	}
 
-	fmt.Println("Server IP addresses:")
 	for _, addr := range addrs {
 		if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
 			if ipnet.IP.To4() != nil {
-				fmt.Println(ipnet.IP.String())
+				ips = append(ips, ipnet.IP.String()[:strings.LastIndex(ipnet.IP.String(), ".")])
 			}
 		}
 	}
+	return ips, nil
+}
+
+func connectToServer(IP_ADDRESS string) (net.Conn, error) {
+	conn, err := net.Dial("tcp", IP_ADDRESS)
+	if err != nil {
+		fmt.Println("Connection error:", err)
+		return nil, err
+	}
+	fmt.Println("Connected to server")
+	return conn, nil
+}
+
+func handleConnection(conn net.Conn, x, y int, hostname string) {
+	defer conn.Close()
+	sendHostname(conn, hostname)
+
+	for {
+		img, _ := screenshot.CaptureDisplay(0)
+		resizedImg := resizeImage(img, uint(x), uint(y))
+
+		var buf bytes.Buffer
+		jpeg.Encode(&buf, resizedImg, nil)
+
+		err := sendImage(conn, buf.Bytes())
+		if err != nil {
+			fmt.Println("Disconnected from server")
+			return
+		}
+	}
+}
+
+func sendHostname(conn net.Conn, hostname string) {
+	hostnameBytes := []byte(hostname)
+	size := int64(len(hostnameBytes))
+	err := binary.Write(conn, binary.LittleEndian, size)
+	if err != nil {
+		fmt.Println("Error sending hostname size:", err)
+		return
+	}
+
+	_, err = conn.Write(hostnameBytes)
+	if err != nil {
+		fmt.Println("Error sending hostname:", err)
+	}
+	fmt.Println("Sent hostname:", hostname)
+}
+
+func sendImage(conn net.Conn, imageData []byte) error {
+	size := int64(len(imageData))
+	fmt.Println("Sending image size:", size)
+	err := binary.Write(conn, binary.LittleEndian, size)
+	if err != nil {
+		return err
+	}
+
+	fmt.Println("Sending image data")
+	_, err = conn.Write(imageData)
+	if err != nil {
+		return err
+	}
+
+	fmt.Println("Image sent")
+	return nil
 }
